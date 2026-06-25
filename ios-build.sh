@@ -1,64 +1,186 @@
-#!/usr/bin/env bash
-# 未签名 IPA（GitHub macos-latest / 本地 Xcode）
-set -euo pipefail
+# 纯 WebView 壳 iOS 未签名 IPA（macOS runner + Capacitor 7）
+name: Build iOS
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-IOS_DIR="${ROOT}/ios/App"
-ARCHIVE="${RUNNER_TEMP:-/tmp}/ustation-ios.xcarchive"
-OUT_IPA="${ROOT}/app-ios.ipa"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: U-Station build record id
+        required: false
+      target_url:
+        description: H5 target URL
+        required: true
+      bundle_id:
+        description: iOS bundle identifier
+        required: true
+      app_name:
+        description: App display name (ASCII fallback)
+        required: true
+      app_name_b64:
+        description: UTF-8 display name base64
+        required: false
+      version_name:
+        description: CFBundleShortVersionString
+        required: true
+      version_code:
+        description: CFBundleVersion
+        required: true
+      platform_url:
+        description: U-Station API base (assets)
+        required: true
+      icon_url:
+        description: optional icon path/url
+        required: false
+      splash_url:
+        description: optional splash path/url
+        required: false
+      square_icon_url:
+        description: optional square icon
+        required: false
+      callback_token:
+        description: platform callback token
+        required: true
+      min_sdk:
+        required: false
+        default: "24"
+      target_sdk:
+        required: false
+        default: "36"
+      compile_sdk:
+        required: false
+        default: "36"
+      fix_apk:
+        required: false
+        default: "true"
+      sign_v1:
+        required: false
+        default: "true"
+      sign_v2:
+        required: false
+        default: "true"
+      sign_v3:
+        required: false
+        default: "true"
+      verify_apk:
+        required: false
+        default: "true"
+      check_production:
+        required: false
+        default: "true"
 
-if [ ! -d "$IOS_DIR" ]; then
-  echo "::error::ios/App missing — run npx cap add ios first"
-  exit 1
-fi
+permissions:
+  contents: write
 
-cd "$IOS_DIR"
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
 
-if [ -f Podfile ]; then
-  pod install --repo-update
-fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-WORKSPACE="App.xcworkspace"
-SCHEME="App"
-if [ ! -d "$WORKSPACE" ]; then
-  WORKSPACE="App.xcodeproj"
-fi
+      - name: Install dependencies
+        run: |
+          node scripts/ensure-www.mjs
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
-echo "[ios-build] workspace=$WORKSPACE scheme=$SCHEME"
+      - name: Apply build config & assets
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          APP_NAME: ${{ inputs.app_name }}
+          APP_NAME_B64: ${{ inputs.app_name_b64 }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          PLATFORM_URL: ${{ inputs.platform_url }}
+          ICON_URL: ${{ inputs.icon_url }}
+          SPLASH_URL: ${{ inputs.splash_url }}
+          SQUARE_ICON_URL: ${{ inputs.square_icon_url }}
+        run: |
+          node scripts/apply-build-config.mjs
+          node scripts/ensure-bundled-assets.mjs
+          node scripts/download-assets.mjs || true
 
-xcodebuild \
-  -workspace "$WORKSPACE" \
-  -scheme "$SCHEME" \
-  -configuration Release \
-  -destination 'generic/platform=iOS' \
-  -archivePath "$ARCHIVE" \
-  archive \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
-  DEVELOPMENT_TEAM="" \
-  | tee xcodebuild.log
+      - name: Capacitor add iOS
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          APP_NAME: ${{ inputs.app_name }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          rm -rf ios
+          npx cap add ios
+          npx cap sync ios
+          test -d ios/App
 
-if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-  echo "::error::xcodebuild archive failed"
-  tail -80 xcodebuild.log || true
-  exit 1
-fi
+      - name: Verify iOS shell
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+        run: node scripts/verify-ios-build.mjs
 
-APP_GLOB="$ARCHIVE/Products/Applications/*.app"
-APP_PATH="$(ls -d $APP_GLOB 2>/dev/null | head -1)"
-if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-  echo "::error::.app not found under archive"
-  find "$ARCHIVE" -maxdepth 5 -type d -name '*.app' || true
-  exit 1
-fi
+      - name: Build unsigned IPA
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: bash ios-build.sh
 
-STAGE="${RUNNER_TEMP:-/tmp}/ipa-stage"
-rm -rf "$STAGE"
-mkdir -p "$STAGE/Payload"
-cp -R "$APP_PATH" "$STAGE/Payload/"
-cd "$STAGE"
-rm -f "$OUT_IPA"
-zip -qr "$OUT_IPA" Payload
+      - name: Verify IPA artifact
+        run: |
+          test -f app-ios.ipa
+          ls -la app-ios.ipa
+          unzip -l app-ios.ipa | head -20
 
-echo "[ios-build] OK $OUT_IPA ($(stat -f%z "$OUT_IPA" 2>/dev/null || stat -c%s "$OUT_IPA") bytes)"
+      - name: Collect IPA
+        id: ipa
+        run: |
+          test -f app-ios.ipa
+          echo "path=app-ios.ipa" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename app-ios.ipa)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -f%z app-ios.ipa)" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-v${{ inputs.version_name }}-${{ github.run_number }}
+          name: iOS v${{ inputs.version_name }} (${{ github.run_number }})
+          files: ${{ steps.ipa.outputs.path }}
+          generate_release_notes: false
+
+      - name: Upload IPA to platform (public download)
+        if: success() && inputs.callback_token != ''
+        env:
+          PLATFORM_URL: ${{ inputs.platform_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_PLATFORM: ios
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_TAG: ios-v${{ inputs.version_name }}-${{ github.run_number }}
+          APK_PATH: ${{ steps.ipa.outputs.path }}
+        run: node scripts/upload-apk-to-platform.mjs || echo "platform upload failed (non-fatal, use GitHub Release)"
+
+      - name: Notify platform (success)
+        if: success()
+        env:
+          PLATFORM_URL: ${{ inputs.platform_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_PLATFORM: ios
+          BUILD_STATUS: success
+          RELEASE_TAG: ios-v${{ inputs.version_name }}-${{ github.run_number }}
+          DOWNLOAD_URL: https://github.com/${{ github.repository }}/releases/download/ios-v${{ inputs.version_name }}-${{ github.run_number }}/${{ steps.ipa.outputs.name }}
+          FILE_SIZE_BYTES: ${{ steps.ipa.outputs.size }}
+        run: node scripts/notify-platform.mjs || true
+
+      - name: Notify platform (failure)
+        if: failure()
+        env:
+          PLATFORM_URL: ${{ inputs.platform_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_PLATFORM: ios
+          BUILD_STATUS: failed
+          BUILD_ERROR: iOS workflow failed
+        run: node scripts/notify-platform.mjs || true
